@@ -1,8 +1,15 @@
 fastapi
 uvicorn
+uvicorn[standard]
+
 sqlalchemy>=2.0
 psycopg2-binary
 alembic
+
 python-dotenv
+pydantic
+
 pgvector
 requests
+
+loguru

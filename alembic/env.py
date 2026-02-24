@@ -4,7 +4,7 @@ from sqlalchemy import pool
 from alembic import context
 
 # Importar seu Base e models
-from app.core.database import Base
+from app.core.database import Base, engine
 from app.models.sync import SyncRun, SyncRunHistory
 from app.models.compra import Compra
 from app.models.orgao_entidade import OrgaoEntidade
@@ -36,17 +36,15 @@ def run_migrations_offline():
     with context.begin_transaction():
         context.run_migrations()
 
-
 def run_migrations_online():
     """Run migrations in 'online' mode."""
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    connectable = engine
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+        )
 
         with context.begin_transaction():
             context.run_migrations()
