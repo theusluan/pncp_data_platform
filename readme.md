@@ -28,7 +28,7 @@ Nesta **Etapa 1**, não há foco em analytics ou IA, mas sim em **fundação té
 ### Stack principal
 
 * **API**: FastAPI
-* **Servidor ASGI**: Uvicorn
+* **Servidor ASGI**: Uvicorngit
 * **Banco de dados**: PostgreSQL
 * **Busca vetorial**: pgvector (habilitado, ainda não explorado)
 * **ORM**: SQLAlchemy (2.x)
