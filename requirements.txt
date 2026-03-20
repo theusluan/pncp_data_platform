@@ -11,5 +11,5 @@ pydantic
 
 pgvector
 requests
-
+pydantic-settings
 loguru

@@ -1,65 +1,175 @@
-import time
 from sqlalchemy.orm import Session
-from app.clients.pncp_client import PNCPClient
-from app.repositories.sync_run_repository import SyncRunRepository
+
+from app.models.compra import Compra
+from app.models.orgao_entidade import OrgaoEntidade
+from app.models.unidade_orgao import UnidadeOrgao
+from app.models.amparo_legal import AmparoLegal
+from app.models.fonte_orcamentaria import FonteOrcamentaria
 
 
 class PNCPEtlService:
-    # Serviço que orquestra a ETL do PNCP (buscar, processar e registrar status)
 
-    def __init__(self):
-        self.client = PNCPClient()            # Cliente HTTP responsável por chamar a API do PNCP
-        self.sync_repo = SyncRunRepository()  # Repositório que controla o status da sincronização no banco
+    def __init__(self, db: Session):
+        # recebe sessão do banco para executar operações
+        self.db = db
 
-    def run(
-        self,
-        db: Session,
-        data_inicial: str,
-        data_final: str,
-        codigo_modalidade: int,
-    ):
-        # Chave única que identifica essa execução de sync no banco
-        resource_key = f"pncp_{data_inicial}_{data_final}_{codigo_modalidade}"
-        sync = self.sync_repo.get_or_create(db, resource_key)  # Cria ou recupera o controle da execução
 
-        pagina = 1
-        total_processados = 0
+    def process_item(self, item: dict):
+        """
+        Processa um item retornado da API do PNCP
+        aplicando inserção relacional e evitando duplicação.
+        """
 
-        try:
-            while True:  # Loop principal de paginação da API
-                for attempt in range(3):  # Tenta buscar a página até 3 vezes
-                    try:
-                        payload = self.client.fetch_page(
-                            data_inicial=data_inicial,
-                            data_final=data_final,
-                            codigo_modalidade=codigo_modalidade,
-                            pagina=pagina,
-                        )
-                        break  # Sai do retry se a chamada à API funcionar
-                    except Exception:
-                        time.sleep(2 ** attempt)  # Backoff exponencial entre as tentativas
-                else:
-                    # Executado se todas as tentativas falharem
-                    raise Exception(f"Falha ao buscar página {pagina}")
+        # --------------------------------------------------
+        # 1️⃣ DEDUPLICAÇÃO DE COMPRA
+        # --------------------------------------------------
 
-                dados = payload.get("data", [])  # Extrai os registros retornados pela API
-                if not dados:
-                    break  # Encerra o loop quando não há mais dados (fim da paginação)
+        compra_existente = self.db.query(Compra).filter(
+            Compra.numero_compra == item.get("numeroCompra"),
+            Compra.ano_compra == item.get("anoCompra"),
+        ).first()
 
-                # 👉 aqui depois entra o upsert no banco
-                total_processados += len(dados)  # Conta quantos registros foram processados
+        # se compra já existir não insere novamente
+        if compra_existente:
+            return False
 
-                pagina += 1  # Avança para a próxima página da API
 
-            # Marca no banco que a execução terminou com sucesso
-            self.sync_repo.update_success(
-                db,
-                sync,
-                processed_rows=total_processados,
-                upserted_rows=total_processados,
+        # --------------------------------------------------
+        # 2️⃣ RELACIONAMENTOS
+        # --------------------------------------------------
+
+        # cria ou recupera registros relacionados
+        orgao = self._get_or_create_orgao(item.get("orgaoEntidade"))
+        unidade = self._get_or_create_unidade(item.get("unidadeOrgao"))
+        amparo = self._get_or_create_amparo(item.get("amparoLegal"))
+
+
+        # --------------------------------------------------
+        # 3️⃣ CRIA COMPRA
+        # --------------------------------------------------
+
+        compra = Compra(
+            numero_compra=item.get("numeroCompra"),
+            processo=item.get("processo"),
+            objeto_compra=item.get("objeto"),
+            ano_compra=item.get("anoCompra"),
+            valor_total_homologado=item.get("valorTotalHomologado"),
+            modalidade_id=item.get("modalidadeId"),
+            modalidade_nome=item.get("modalidadeNome"),
+            situacao_compra_id=item.get("situacaoCompraId"),
+            situacao_compra_nome=item.get("situacaoCompraNome"),
+            usuario_nome=item.get("usuarioNome"),
+            orgao_entidade_id=orgao.id if orgao else None,
+            unidade_orgao_id=unidade.id if unidade else None,
+            amparo_legal_id=amparo.id if amparo else None
+        )
+
+        # adiciona compra na sessão
+        self.db.add(compra)
+
+        # flush gera ID da compra antes de inserir relacionamentos
+        self.db.flush()
+
+
+        # --------------------------------------------------
+        # 4️⃣ FONTES ORÇAMENTÁRIAS
+        # --------------------------------------------------
+
+        fontes = item.get("fontesOrcamentarias", [])
+
+        for fonte in fontes:
+
+            # cria fonte orçamentária vinculada à compra
+            fonte_obj = FonteOrcamentaria(
+                codigo=fonte.get("codigo"),
+                nome=fonte.get("nome"),
+                descricao=fonte.get("descricao"),
+                compra_id=compra.id
             )
 
-        except Exception as e:
-            # Marca no banco que a execução falhou e salva o erro
-            self.sync_repo.update_error(db, sync, str(e))
-            raise  # Relança a exceção para quem chamou saber que falhou
+            self.db.add(fonte_obj)
+
+        # retorna True indicando que houve inserção
+        return True
+
+
+    def _get_or_create_orgao(self, data):
+
+        # se não houver dados retorna vazio
+        if not data:
+            return None
+
+        # busca órgão pelo CNPJ
+        orgao = self.db.query(OrgaoEntidade).filter(
+            OrgaoEntidade.cnpj == data.get("cnpj")
+        ).first()
+
+        if orgao:
+            return orgao
+
+        # cria novo órgão caso não exista
+        orgao = OrgaoEntidade(
+            cnpj=data.get("cnpj"),
+            razao_social=data.get("razaoSocial"),
+            poder_id=data.get("poderId"),
+            esfera_id=data.get("esferaId"),
+        )
+
+        self.db.add(orgao)
+        self.db.flush()
+
+        return orgao
+
+
+    def _get_or_create_unidade(self, data):
+
+        if not data:
+            return None
+
+        # busca unidade pelo código
+        unidade = self.db.query(UnidadeOrgao).filter(
+            UnidadeOrgao.codigo_unidade == data.get("codigoUnidade")
+        ).first()
+
+        if unidade:
+            return unidade
+
+        unidade = UnidadeOrgao(
+            uf_nome=data.get("ufNome"),
+            uf_sigla=data.get("ufSigla"),
+            codigo_unidade=data.get("codigoUnidade"),
+            municipio_nome=data.get("municipioNome"),
+            nome_unidade=data.get("nomeUnidade"),
+            codigo_ibge=data.get("codigoIbge"),
+        )
+
+        self.db.add(unidade)
+        self.db.flush()
+
+        return unidade
+
+
+    def _get_or_create_amparo(self, data):
+
+        if not data:
+            return None
+
+        # busca amparo legal pelo código
+        amparo = self.db.query(AmparoLegal).filter(
+            AmparoLegal.codigo == data.get("codigo")
+        ).first()
+
+        if amparo:
+            return amparo
+
+        # cria novo amparo legal
+        amparo = AmparoLegal(
+            codigo=data.get("codigo"),
+            nome=data.get("nome"),
+            descricao=data.get("descricao"),
+        )
+
+        self.db.add(amparo)
+        self.db.flush()
+
+        return amparo

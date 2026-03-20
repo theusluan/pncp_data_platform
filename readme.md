@@ -1,189 +1,255 @@
-# PNCP Data Platform
+# 🚀 PNCP Data Platform
 
-Plataforma de dados para ingestão, controle e monitoramento de informações do
+Plataforma de dados para ingestão, processamento e organização de informações do
 **Portal Nacional de Contratações Públicas (PNCP)**.
 
-Este projeto implementa a **Etapa 1 de um pipeline de dados**, com foco em:
-infraestrutura, controle de execuções, versionamento de schema e observabilidade,
-utilizando API REST e ambiente totalmente dockerizado.
+Este projeto evolui de um pipeline ETL tradicional para uma **Data Platform moderna**, com foco em:
+
+* Ingestão confiável de dados públicos
+* Modelagem relacional consistente
+* Controle de execuções (idempotência)
+* Preparação para busca semântica (embeddings + vetores)
 
 ---
 
-## 🎯 Objetivo do projeto
+# 🎯 Objetivo
 
-O objetivo da PNCP Data Platform é criar uma base sólida para:
+Construir uma base sólida para:
 
-* Ingestão estruturada de dados do PNCP
-* Controle de sincronizações e reprocessamentos
-* Registro histórico de execuções (sucesso, erro, tempo)
-* Exposição de endpoints para orquestração e monitoramento
-* Preparação do ambiente para embeddings e busca vetorial
-
-Nesta **Etapa 1**, não há foco em analytics ou IA, mas sim em **fundação técnica confiável**.
+✔ Ingestão estruturada de dados do PNCP
+✔ Processamento ETL relacional completo
+✔ Garantia de integridade entre tabelas
+✔ Controle de execuções e reprocessamento
+✔ Evolução para busca inteligente (IA / embeddings)
 
 ---
 
-## 🧱 Arquitetura (Etapa 1)
+# 🧱 Arquitetura
 
-### Stack principal
+## Stack principal
 
 * **API**: FastAPI
-* **Servidor ASGI**: Uvicorngit
-* **Banco de dados**: PostgreSQL
-* **Busca vetorial**: pgvector (habilitado, ainda não explorado)
-* **ORM**: SQLAlchemy (2.x)
+* **Servidor**: Uvicorn
+* **Banco**: PostgreSQL
+* **ORM**: SQLAlchemy 2.x
 * **Migrations**: Alembic
 * **Infraestrutura**: Docker + Docker Compose
-
-### Componentes
-
-* Container da API (`pncp_api`)
-* Container do banco (`pncp_postgres`)
-* Comunicação via rede interna Docker
+* **Vetores (futuro)**: pgvector
 
 ---
 
-## 📂 Estrutura do projeto
+## Componentes
 
+* `pncp_api` → API + ETL
+* `pncp_postgres` → Banco de dados
+* Comunicação via rede Docker
+
+---
+
+# ⚙️ Pipeline ETL (Atual)
+
+O pipeline implementado realiza:
+
+1. Criação de controle de execução (sync_run)
+2. Paginação automática na API do PNCP
+3. Retry por página (resiliência)
+4. Processamento ETL
+5. Inserção relacional:
+
+   * unidade_orgao
+   * orgao_entidade
+   * compra
+   * fontes_orcamentarias
+6. Atualização de status final
+
+---
+
+# 🗄️ Modelagem de Dados
+
+## Tabelas principais
+
+### 🔹 Controle
+
+* `sync_run` → execução atual
+* `sync_run_history` → histórico completo
+
+---
+
+### 🔹 Domínio (PNCP)
+
+* `compra`
+* `orgao_entidade`
+* `unidade_orgao`
+* `fontes_orcamentarias`
+* `amparo_legal`
+
+---
+
+## 🔗 Relacionamentos
+
+unidade_orgao → compra → fontes_orcamentarias
+orgao_entidade → compra
+
+✔ Integridade referencial garantida
+✔ Foreign Keys funcionando
+✔ Pipeline relacional validado
+
+---
+
+# 🔑 Identificação dos dados
+
+O sistema utiliza:
+
+* **UUID (Primary Key)** → interno (seguro e escalável)
+* **Campos de negócio** → leitura humana
+
+Exemplo:
+
+UUID → controle interno
+numero_compra → identificação real
+codigo_unidade → identificação organizacional
+
+---
+
+# 🌐 Endpoints
+
+| Método | Endpoint                 | Descrição                        |
+| ------ | ------------------------ | -------------------------------- |
+| GET    | `/health`                | Status da API e banco            |
+| POST   | `/init`                  | Executa ETL completo             |
+| POST   | `/update`                | Atualização incremental (futuro) |
+| GET    | `/status/{resource_key}` | Status da execução               |
+
+---
+
+## 📌 Exemplo de execução
+
+POST /init
+
+```json
+{
+  "dataInicial": "20260128",
+  "dataFinal": "20260129",
+  "codigoModalidade": 8,
+  "resource_key": "insert_relacional_20260128_20260129_mod8"
+}
 ```
-pncp_data_platform/
-├── app/
-│   ├── api.py              # Entrypoint da FastAPI
-│   ├── core/               # Configurações, banco, sessão
-│   ├── models/             # Models ORM (SQLAlchemy)
-│   └── services/           # Regras de negócio / ETL
-│
-├── alembic/                # Migrations
-│   ├── versions/
-│   └── env.py
-│
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── .env.example
-├── .gitignore
-└── README.md
+
+---
+
+## ✅ Resposta esperada
+
+```json
+{
+  "status": "ok",
+  "resource_key": "...",
+  "total_inseridos": 2643
+}
 ```
 
 ---
 
-## 🗄️ Banco de dados
+# 🐳 Como rodar o projeto
 
-### Tabelas principais
-
-* `alembic_version` — controle de migrations (esperado)
-* `sync_run` — estado atual de cada recurso sincronizado
-* `sync_run_history` — histórico completo de execuções
-* Tabelas de domínio (PNCP):
-
-  * `compra`
-  * `orgao_entidade`
-  * `unidade_orgao`
-  * `fonte_orcamentaria`
-
----
-
-## 🌐 Endpoints disponíveis
-
-| Método | Endpoint                 | Descrição                                     |
-| ------ | ------------------------ | --------------------------------------------- |
-| GET    | `/health`                | Verifica status da API e conexão com o banco  |
-| POST   | `/init`                  | Inicializa registros de controle (`sync_run`) |
-| POST   | `/update`                | Executa atualização/simulação de carga        |
-| GET    | `/status/{resource_key}` | Consulta última execução de um recurso        |
-
-### Documentação automática
-
-* Swagger UI: `http://localhost:8000/docs`
-
----
-
-## ⚙️ Como rodar o projeto
-
-### Pré-requisitos
-
-* Docker
-* Docker Compose
-
----
-
-### 🐳 Execução via Docker (recomendado)
-
-1. Clone o repositório:
+## 1. Clonar repositório
 
 ```bash
 git clone https://github.com/theusluan/pncp_data_platform.git
 cd pncp_data_platform
 ```
 
-2. Crie o arquivo de ambiente:
+---
+
+## 2. Criar `.env`
 
 ```bash
 cp .env.example .env
 ```
 
-3. Suba os containers:
+---
+
+## 3. Subir containers
 
 ```bash
 docker-compose up --build
 ```
 
-4. Acesse:
+---
 
-* API: `http://localhost:8000`
-* Health check: `http://localhost:8000/health`
-* Swagger: `http://localhost:8000/docs`
+## 4. Acessos
+
+* API → http://localhost:8000
+* Swagger → http://localhost:8000/docs
+* Health → http://localhost:8000/health
 
 ---
 
-## 🧪 Migrations (Alembic)
+# 🧪 Migrations
 
-As migrations são executadas dentro do container da API.
-
-### Executar migrations manualmente
+Rodar dentro do container:
 
 ```bash
 docker exec -it pncp_api alembic upgrade head
 ```
 
-A presença da tabela `alembic_version` no banco **é esperada e correta**.
+---
+
+# 🔍 Validação de dados
+
+```sql
+SELECT COUNT(*) FROM compra;
+```
+
+```sql
+SELECT 
+    c.numero_compra,
+    u.nome_unidade
+FROM compra c
+JOIN unidade_orgao u ON u.id = c.unidade_orgao_id
+LIMIT 10;
+```
 
 ---
 
-## 🧠 Variáveis de ambiente
+# 🧠 Próximos passos (Roadmap)
 
+## 🔥 Fase atual (concluída)
 
-Arquivo de exemplo (`.env.example`):
+* ✔ ETL relacional
+* ✔ Controle de execução
+* ✔ Migrations
+* ✔ Docker
 
-```env
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres123
-POSTGRES_DB=pncp_db
+---
 
-DATABASE_URL=postgresql+psycopg2://postgres:postgres123@pncp_postgres:5432/pncp_db
-```
+## 🚀 Próxima fase
 
+* 🔹 UPSERT (evitar duplicidade)
+* 🔹 Carga incremental
+* 🔹 Auditoria completa
 
-## 🧪 Como testar os endpoints
+---
 
-Utilize:
+## 🤖 Fase futura (IA)
 
-* Swagger (`/docs`)
-* Postman / Insomnia
-* Curl
+* 🔹 Embeddings (vectorização)
+* 🔹 pgvector
+* 🔹 Busca semântica
+* 🔹 RAG (chat com dados do PNCP)
 
-Exemplo:
+---
 
-```bash
-curl http://localhost:8000/health
-```
+# 🧠 Conceitos aplicados
 
-Resposta esperada:
+* Data Engineering
+* ETL Pipeline
+* Idempotência
+* Modelagem relacional
+* Observabilidade
+* Arquitetura de dados moderna
 
-```json
-{
-  "status": "ok",
-  "database": "connected"
-}
-```
+---
 
+# 📌 Autor
+
+Desenvolvido por Matheus Luan 🚀

@@ -1,2 +1,35 @@
+# Ambiente
 .env
 .env.*
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# Alembic (opcional manter versionado)
+# migrations não devem ser ignoradas!
+
+# Testes / cache
+.pytest_cache/
+
+# Build
+dist/
+build/
