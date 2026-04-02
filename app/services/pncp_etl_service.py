@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.models.compra import Compra
 from app.models.orgao_entidade import OrgaoEntidade
@@ -6,22 +7,40 @@ from app.models.unidade_orgao import UnidadeOrgao
 from app.models.amparo_legal import AmparoLegal
 from app.models.fonte_orcamentaria import FonteOrcamentaria
 
+from app.services.embedding_service import generate_embedding
+
 
 class PNCPEtlService:
+    """
+    Service responsável por:
+    - Processar dados da API PNCP (ETL)
+    - Inserir dados no banco
+    - Gerar embeddings
+    - Realizar busca semântica
+    """
 
     def __init__(self, db: Session):
-        # recebe sessão do banco para executar operações
         self.db = db
 
+    # ==================================================
+    # =================== ETL ===========================
+    # ==================================================
 
     def process_item(self, item: dict):
         """
-        Processa um item retornado da API do PNCP
-        aplicando inserção relacional e evitando duplicação.
+        Processa um item da API e insere no banco
+        evitando duplicação
         """
 
+        from loguru import logger
+
+        # 🔹 Log simples para debug
+        logger.warning("====================================")
+        logger.warning(f"NUMERO COMPRA: {item.get('numeroCompra')}")
+        logger.warning(f"OBJETO API: {item.get('objetoCompra')}")
+
         # --------------------------------------------------
-        # 1️⃣ DEDUPLICAÇÃO DE COMPRA
+        # 1️⃣ DEDUPLICAÇÃO
         # --------------------------------------------------
 
         compra_existente = self.db.query(Compra).filter(
@@ -29,29 +48,40 @@ class PNCPEtlService:
             Compra.ano_compra == item.get("anoCompra"),
         ).first()
 
-        # se compra já existir não insere novamente
+        # Se já existe, não insere novamente
         if compra_existente:
             return False
-
 
         # --------------------------------------------------
         # 2️⃣ RELACIONAMENTOS
         # --------------------------------------------------
 
-        # cria ou recupera registros relacionados
         orgao = self._get_or_create_orgao(item.get("orgaoEntidade"))
         unidade = self._get_or_create_unidade(item.get("unidadeOrgao"))
         amparo = self._get_or_create_amparo(item.get("amparoLegal"))
 
+        # --------------------------------------------------
+        # 3️⃣ EMBEDDING
+        # --------------------------------------------------
+
+        objeto = item.get("objetoCompra")
+
+        # 🔥 Gera vetor baseado no texto
+        embedding = generate_embedding(objeto)
+
+        if embedding:
+            logger.warning(f"Embedding gerado com {len(embedding)} dimensões")
+        else:
+            logger.warning("Embedding NÃO gerado")
 
         # --------------------------------------------------
-        # 3️⃣ CRIA COMPRA
+        # 4️⃣ CRIA COMPRA
         # --------------------------------------------------
 
         compra = Compra(
             numero_compra=item.get("numeroCompra"),
             processo=item.get("processo"),
-            objeto_compra=item.get("objeto"),
+            objeto_compra=objeto,
             ano_compra=item.get("anoCompra"),
             valor_total_homologado=item.get("valorTotalHomologado"),
             modalidade_id=item.get("modalidadeId"),
@@ -61,45 +91,97 @@ class PNCPEtlService:
             usuario_nome=item.get("usuarioNome"),
             orgao_entidade_id=orgao.id if orgao else None,
             unidade_orgao_id=unidade.id if unidade else None,
-            amparo_legal_id=amparo.id if amparo else None
+            amparo_legal_id=amparo.id if amparo else None,
+
+            # 🔥 NOVO CAMPO (embedding)
+            vector=embedding
         )
 
-        # adiciona compra na sessão
         self.db.add(compra)
 
-        # flush gera ID da compra antes de inserir relacionamentos
+        # 🔥 Garante ID antes de inserir filhos
         self.db.flush()
 
-
         # --------------------------------------------------
-        # 4️⃣ FONTES ORÇAMENTÁRIAS
+        # 5️⃣ FONTES ORÇAMENTÁRIAS
         # --------------------------------------------------
 
         fontes = item.get("fontesOrcamentarias", [])
 
         for fonte in fontes:
-
-            # cria fonte orçamentária vinculada à compra
             fonte_obj = FonteOrcamentaria(
                 codigo=fonte.get("codigo"),
                 nome=fonte.get("nome"),
                 descricao=fonte.get("descricao"),
                 compra_id=compra.id
             )
-
             self.db.add(fonte_obj)
 
-        # retorna True indicando que houve inserção
         return True
 
+    # ==================================================
+    # ============ BUSCA SEMÂNTICA (NOVO) ===============
+    # ==================================================
+
+    def search_similar(self, query: str, limit: int = 5):
+        """
+        Busca compras similares com base no embedding
+
+        🔹 Como funciona:
+        1. Gera embedding da query
+        2. Compara com embeddings do banco
+        3. Retorna os mais próximos
+        """
+
+        from loguru import logger
+
+        # 🔥 Gera embedding da busca
+        embedding = generate_embedding(query)
+
+        if not embedding:
+            return []
+
+        logger.warning(f"Buscando similares para: {query}")
+
+        # 🔥 Query usando pgvector (<-> = distância)
+        sql = text("""
+            SELECT 
+                id,
+                objeto_compra,
+                vector <-> :embedding AS distancia
+            FROM compra
+            WHERE vector IS NOT NULL
+            ORDER BY vector <-> :embedding
+            LIMIT :limit
+        """)
+
+        result = self.db.execute(
+            sql,
+            {
+                "embedding": embedding,
+                "limit": limit
+            }
+        )
+
+        # 🔥 Formata resposta
+        return [
+            {
+                "id": str(row.id),
+                "objeto_compra": row.objeto_compra,
+                "distancia": float(row.distancia)
+            }
+            for row in result
+        ]
+
+    # ==================================================
+    # ========= MÉTODOS AUXILIARES ======================
+    # ==================================================
 
     def _get_or_create_orgao(self, data):
 
-        # se não houver dados retorna vazio
         if not data:
             return None
 
-        # busca órgão pelo CNPJ
         orgao = self.db.query(OrgaoEntidade).filter(
             OrgaoEntidade.cnpj == data.get("cnpj")
         ).first()
@@ -107,7 +189,6 @@ class PNCPEtlService:
         if orgao:
             return orgao
 
-        # cria novo órgão caso não exista
         orgao = OrgaoEntidade(
             cnpj=data.get("cnpj"),
             razao_social=data.get("razaoSocial"),
@@ -120,13 +201,11 @@ class PNCPEtlService:
 
         return orgao
 
-
     def _get_or_create_unidade(self, data):
 
         if not data:
             return None
 
-        # busca unidade pelo código
         unidade = self.db.query(UnidadeOrgao).filter(
             UnidadeOrgao.codigo_unidade == data.get("codigoUnidade")
         ).first()
@@ -148,13 +227,11 @@ class PNCPEtlService:
 
         return unidade
 
-
     def _get_or_create_amparo(self, data):
 
         if not data:
             return None
 
-        # busca amparo legal pelo código
         amparo = self.db.query(AmparoLegal).filter(
             AmparoLegal.codigo == data.get("codigo")
         ).first()
@@ -162,7 +239,6 @@ class PNCPEtlService:
         if amparo:
             return amparo
 
-        # cria novo amparo legal
         amparo = AmparoLegal(
             codigo=data.get("codigo"),
             nome=data.get("nome"),

@@ -10,7 +10,6 @@ from loguru import logger
 
 from app.core.database import get_db
 from app.models.sync import SyncRun
-from app.models.compra import Compra
 
 # service responsável pelo processamento ETL
 from app.services.pncp_etl_service import PNCPEtlService
@@ -22,17 +21,14 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# endpoint público da API do PNCP
 PNCP_API_URL = "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao"
 
-# quantidade máxima de tentativas por página
 MAX_RETRIES_PER_PAGE = 3
-
-# tempo de espera entre tentativas
 RETRY_WAIT_SECONDS = 5
+PAGE_SIZE = 10
 
-# tamanho da paginação da API
-PAGE_SIZE = 25
+# 🛑 limite de TESTE (por licitação completa)
+MAX_ITENS = 10
 
 
 # ==========================================================
@@ -63,19 +59,18 @@ class SyncStatusResponse(BaseModel):
     upserted_rows: int
     last_error: Optional[str]
 
+class SearchRequest(BaseModel):
+    query: str
+    limit: Optional[int] = 5
+
 
 # ==========================================================
 # ====================== HEALTHCHECK =======================
 # ==========================================================
 
-@app.get(
-    "/health",
-    summary="Healthcheck da aplicação",
-    description="Verifica se a API está ativa e se a conexão com o banco está funcionando.",
-)
+@app.get("/health")
 def health(db: Session = Depends(get_db)):
     try:
-        # executa query simples para validar conexão com banco
         db.execute(text("SELECT 1"))
         return {"status": "ok", "database": "connected"}
     except SQLAlchemyError as e:
@@ -90,26 +85,12 @@ def health(db: Session = Depends(get_db)):
 # ========================= INIT ===========================
 # ==========================================================
 
-@app.post(
-    "/init",
-    summary="Inicializar sincronização PNCP",
-    description="""
-Executa sincronização completa buscando dados do PNCP por intervalo de datas.
-
-Fluxo:
-- Cria registro em `sync_run`
-- Realiza paginação automática
-- Aplica retry por página
-- Processa ETL
-- Atualiza status final
-""",
-)
+@app.post("/init")
 def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
 
     resource_key = payload.resource_key
 
     try:
-        # cria registro de execução da sincronização
         sync_run = SyncRun(resource_key=resource_key, status="running")
         db.add(sync_run)
         db.commit()
@@ -121,7 +102,6 @@ def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
             detail=f"Erro ao iniciar sincronização: {str(e)}",
         )
 
-    # instancia service de ETL
     service = PNCPEtlService(db)
 
     pagina = 1
@@ -133,7 +113,6 @@ def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
         for tentativa in range(1, MAX_RETRIES_PER_PAGE + 1):
             try:
 
-                # chama API do PNCP
                 response = requests.get(
                     PNCP_API_URL,
                     params={
@@ -148,52 +127,65 @@ def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
 
                 response.raise_for_status()
 
-                # extrai lista de registros
                 data = response.json().get("data", [])
 
-                # se não houver dados encerra paginação
                 if not data:
                     success = True
                     break
 
                 inseridos_pagina = 0
+                limite_atingido = False  # 👈 controle forte
 
                 for item in data:
 
-                    # processa registro via service ETL
+                    # 🛑 trava ANTES de processar
+                    if total_inseridos >= MAX_ITENS:
+                        logger.info("🚫 Limite atingido antes de processar")
+                        limite_atingido = True
+                        break
+
                     inserted = service.process_item(item)
 
-                    # incrementa contador apenas se realmente inseriu
                     if inserted:
+                        total_inseridos += 1
                         inseridos_pagina += 1
 
-                # commit da página processada
+                        # 🛑 trava IMEDIATA após inserir
+                        if total_inseridos >= MAX_ITENS:
+                            logger.info("🚫 Limite atingido após inserir")
+                            limite_atingido = True
+                            break
+
+                # commit apenas do que foi processado corretamente
                 db.commit()
 
-                total_inseridos += inseridos_pagina
+                logger.info(f"Página {pagina} processada ({inseridos_pagina} licitações)")
 
-                logger.info(f"Página {pagina} processada ({inseridos_pagina} inseridos)")
+                if limite_atingido:
+                    success = True
+                    break
 
                 success = True
                 break
 
             except (requests.RequestException, SQLAlchemyError, IntegrityError) as e:
 
-                # desfaz todas inserções da página em caso de erro
                 db.rollback()
-
                 logger.warning(f"Erro página {pagina}, tentativa {tentativa}: {e}")
-
                 time.sleep(RETRY_WAIT_SECONDS * tentativa)
 
         if not success:
             logger.error(f"Falha definitiva na página {pagina}")
             break
 
+        # 🛑 parada global
+        if total_inseridos >= MAX_ITENS:
+            logger.info("🏁 Encerrando por limite de teste")
+            break
+
         pagina += 1
 
     try:
-        # atualiza status final da sincronização
         sync_run.status = "completed"
         sync_run.processed_rows = total_inseridos
         db.commit()
@@ -205,6 +197,7 @@ def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
         "status": "ok",
         "resource_key": resource_key,
         "total_inseridos": total_inseridos,
+        "limite": MAX_ITENS,
     }
 
 
@@ -212,21 +205,15 @@ def init_sync(payload: InitRequest, db: Session = Depends(get_db)):
 # ======================== UPDATE ==========================
 # ==========================================================
 
-@app.post(
-    "/update",
-    summary="Atualizar status da sincronização",
-    description="Atualiza manualmente os dados de uma execução já existente.",
-)
+@app.post("/update")
 def update_sync(payload: UpdateRequest, db: Session = Depends(get_db)):
 
-    # busca sincronização existente
     sync_run = db.query(SyncRun).filter(SyncRun.resource_key == payload.resource_key).first()
 
     if not sync_run:
         raise HTTPException(status_code=404, detail="Sync run não encontrada")
 
     try:
-        # atualiza métricas da execução
         sync_run.status = "updated"
         sync_run.processed_rows = payload.processed_rows
         sync_run.upserted_rows = payload.upserted_rows
@@ -245,15 +232,9 @@ def update_sync(payload: UpdateRequest, db: Session = Depends(get_db)):
 # ========================= STATUS =========================
 # ==========================================================
 
-@app.get(
-    "/status/{resource_key}",
-    response_model=SyncStatusResponse,
-    summary="Consultar status da sincronização",
-    description="Retorna o estado atual da sincronização pelo resource_key.",
-)
+@app.get("/status/{resource_key}", response_model=SyncStatusResponse)
 def status_sync(resource_key: str, db: Session = Depends(get_db)):
 
-    # busca execução da sincronização
     sync_run = db.query(SyncRun).filter(SyncRun.resource_key == resource_key).first()
 
     if not sync_run:
@@ -270,3 +251,34 @@ def status_sync(resource_key: str, db: Session = Depends(get_db)):
         upserted_rows=sync_run.upserted_rows,
         last_error=sync_run.last_error,
     )
+
+# ==========================================================
+# ==================== SEARCH (NOVO) =======================
+# ==========================================================
+
+@app.post("/search")
+def search(payload: SearchRequest, db: Session = Depends(get_db)):
+    """
+    Endpoint de busca semântica
+
+    Recebe um texto e retorna compras similares
+    """
+
+    service = PNCPEtlService(db)
+
+    try:
+        results = service.search_similar(
+            query=payload.query,
+            limit=payload.limit
+        )
+
+        return {
+            "query": payload.query,
+            "results": results
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
